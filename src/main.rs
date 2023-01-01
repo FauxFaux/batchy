@@ -7,10 +7,10 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use axum::body::{self, BoxBody, Bytes};
-use axum::extract::Path;
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::Response;
-use axum::{Extension, Json, Router};
+use axum::{Json, Router};
 use log::{error, warn};
 use serde::Serialize;
 use serde_json::json;
@@ -51,7 +51,7 @@ fn parse_date(date: &str) -> Option<OffsetDateTime> {
     OffsetDateTime::parse(date, &Rfc3339).ok()
 }
 
-async fn list_files(Extension(state): Extension<Output>) -> (StatusCode, Json<Value>) {
+async fn list_files(State(state): State<Arc<Output>>) -> (StatusCode, Json<Value>) {
     let live_name = state
         .out
         .lock()
@@ -128,7 +128,7 @@ fn empty_status_response(status_code: StatusCode) -> Response {
         .expect("static response")
 }
 
-async fn cycle(Extension(state): Extension<Output>) -> (StatusCode, Json<Value>) {
+async fn cycle(State(state): State<Arc<Output>>) -> (StatusCode, Json<Value>) {
     okay_or_500(|| async {
         let mut previous = state.out.lock().await.replace(new_file()?);
 
@@ -153,7 +153,7 @@ async fn okay_or_500<F: Future<Output = Result<Value>>>(
     }
 }
 
-async fn store(buf: Bytes, Extension(state): Extension<Output>) -> (StatusCode, Json<Value>) {
+async fn store(State(state): State<Arc<Output>>, buf: Bytes) -> (StatusCode, Json<Value>) {
     if buf.len() > 4 * 1024 * 1024 {
         return (
             StatusCode::BAD_REQUEST,
@@ -207,7 +207,7 @@ async fn main() -> Result<()> {
         .route("/api/raw", get(list_files))
         .route("/api/raw/:name", get(fetch_raw))
         .route("/api/cycle", post(cycle))
-        .layer(Extension(state));
+        .with_state(Arc::new(state));
 
     axum::Server::bind(&"0.0.0.0:3000".parse().unwrap())
         .serve(app.into_make_service())
