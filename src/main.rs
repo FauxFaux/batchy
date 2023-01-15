@@ -3,6 +3,7 @@ mod shutdown;
 use std::fs;
 use std::future::Future;
 use std::io::Write;
+use std::net::Ipv6Addr;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -11,7 +12,7 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::Response;
 use axum::{Json, Router};
-use log::{error, warn};
+use bunyarrs::{vars, vars_dbg, Bunyarr};
 use serde::Serialize;
 use serde_json::json;
 use serde_json::Value;
@@ -27,14 +28,17 @@ struct Writer {
     name: String,
 }
 
-#[derive(Clone)]
 struct Output {
     out: Arc<sync::Mutex<Option<Writer>>>,
+    logger: Bunyarr,
 }
 
-fn finish(writer: &mut Option<Writer>) -> std::io::Result<()> {
+fn finish(logger: &Bunyarr, writer: &mut Option<Writer>) -> std::io::Result<()> {
     match writer.take() {
-        Some(writer) => writer.inner.finish()?.flush()?,
+        Some(writer) => {
+            writer.inner.finish()?.flush()?;
+            logger.info(json!({ "file_name": writer.name }), "completed file");
+        }
         None => unimplemented!("already shutdown"),
     };
     Ok(())
@@ -52,6 +56,7 @@ fn parse_date(date: &str) -> Option<OffsetDateTime> {
 }
 
 async fn list_files(State(state): State<Arc<Output>>) -> (StatusCode, Json<Value>) {
+    let logger = &state.logger;
     let live_name = state
         .out
         .lock()
@@ -60,7 +65,7 @@ async fn list_files(State(state): State<Arc<Output>>) -> (StatusCode, Json<Value
         .map(|v| v.name.to_string())
         .unwrap_or(String::new());
     let mut items = Vec::new();
-    okay_or_500(|| async {
+    okay_or_500(logger, || async {
         for f in fs::read_dir(".")? {
             let f = f?;
 
@@ -96,7 +101,7 @@ async fn list_files(State(state): State<Arc<Output>>) -> (StatusCode, Json<Value
     .await
 }
 
-async fn fetch_raw(Path(name): Path<String>) -> Response {
+async fn fetch_raw(State(state): State<Arc<Output>>, Path(name): Path<String>) -> Response {
     if parse_date(&name).is_none() {
         return empty_status_response(StatusCode::BAD_REQUEST);
     }
@@ -114,8 +119,8 @@ async fn fetch_raw(Path(name): Path<String>) -> Response {
         //         format!("attachment; filename=\"{}\"", file_name),
         //     ),
         Ok(res) => res.map(body::boxed),
-        Err(e) => {
-            warn!("unable to serve file: {:?}", e);
+        Err(err) => {
+            state.logger.warn(vars_dbg!(err), "unable to serve file");
             empty_status_response(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
@@ -129,22 +134,23 @@ fn empty_status_response(status_code: StatusCode) -> Response {
 }
 
 async fn cycle(State(state): State<Arc<Output>>) -> (StatusCode, Json<Value>) {
-    okay_or_500(|| async {
-        let mut previous = state.out.lock().await.replace(new_file()?);
+    okay_or_500(&state.logger, || async {
+        let mut previous = state.out.lock().await.replace(new_file(&state.logger)?);
 
-        finish(&mut previous)?;
+        finish(&state.logger, &mut previous)?;
         Ok(json!({}))
     })
     .await
 }
 
 async fn okay_or_500<F: Future<Output = Result<Value>>>(
+    logger: &Bunyarr,
     func: impl FnOnce() -> F,
 ) -> (StatusCode, Json<Value>) {
     match func().await {
         Ok(resp) => (StatusCode::OK, Json(resp)),
-        Err(e) => {
-            error!("handling request: {:?}", e);
+        Err(err) => {
+            logger.error(vars_dbg!(err), "error handling request");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({ "error": "internal server error "})),
@@ -163,7 +169,7 @@ async fn store(State(state): State<Arc<Output>>, buf: Bytes) -> (StatusCode, Jso
     let item_length = u64::try_from(8 + 8 + buf.len()).expect("4MB < 2^64 bytes");
     let now = OffsetDateTime::now_utc().unix_timestamp();
 
-    okay_or_500(|| async {
+    okay_or_500(&state.logger, || async {
         match state.out.lock().await.as_mut() {
             Some(file) => {
                 file.inner.write_all(&item_length.to_le_bytes())?;
@@ -184,21 +190,24 @@ fn path_for_now() -> String {
     format!("{}.events.zstd", time)
 }
 
-fn new_file() -> std::io::Result<Writer> {
-    let name = path_for_now();
+fn new_file(logger: &Bunyarr) -> std::io::Result<Writer> {
+    let file_name = path_for_now();
+    let inner = zstd::Encoder::new(fs::File::create(&file_name)?, 3)?;
+    logger.info(vars!(file_name), "new event file created");
     Ok(Writer {
-        inner: zstd::Encoder::new(fs::File::create(&name)?, 3)?,
-        name,
+        inner,
+        name: file_name,
     })
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    env_logger::init();
+    let logger = Bunyarr::with_name("batchy");
 
-    let rc = Arc::new(sync::Mutex::new(Some(new_file()?)));
+    let rc = Arc::new(sync::Mutex::new(Some(new_file(&logger)?)));
     let state = Output {
         out: Arc::clone(&rc),
+        logger: Bunyarr::with_name("batchy-handler"),
     };
 
     use axum::routing::{get, post};
@@ -209,13 +218,16 @@ async fn main() -> Result<()> {
         .route("/api/cycle", post(cycle))
         .with_state(Arc::new(state));
 
-    axum::Server::bind(&"0.0.0.0:3000".parse().unwrap())
+    let port = 3000;
+    logger.info(vars!(port), "server starting");
+    axum::Server::bind(&(Ipv6Addr::UNSPECIFIED, port).into())
         .serve(app.into_make_service())
         .with_graceful_shutdown(shutdown::shutdown_signal())
         .await?;
 
     let mut guard = rc.lock().await;
-    finish(&mut guard)?;
+    finish(&logger, &mut guard)?;
 
+    logger.info((), "shutdown success");
     Ok(())
 }

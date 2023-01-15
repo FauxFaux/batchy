@@ -1,4 +1,4 @@
-use log::info;
+use bunyarrs::Bunyarr;
 use tokio::signal;
 
 pub async fn shutdown_signal() {
@@ -24,5 +24,6 @@ pub async fn shutdown_signal() {
         _ = terminate => {},
     }
 
-    info!("signal received, starting graceful shutdown");
+    let logger = Bunyarr::with_name("batchy");
+    logger.info((), "signal received, starting graceful shutdown");
 }
