@@ -3,6 +3,7 @@ mod shutdown;
 
 use std::fs;
 use std::future::Future;
+use std::io::Write;
 use std::net::Ipv6Addr;
 use std::sync::Arc;
 
@@ -27,6 +28,8 @@ struct Writer {
 }
 
 pub struct Output {
+    // None means we're in some kind of error state, either shutting down,
+    // or unable to create a new file
     out: Arc<sync::Mutex<Option<Writer>>>,
     logger: Bunyarr,
 }
@@ -37,7 +40,7 @@ fn finish(logger: &Bunyarr, writer: &mut Option<Writer>) -> Result<()> {
             writer.inner.finish()?;
             logger.info(json!({ "file_name": writer.name }), "completed file");
         }
-        None => unimplemented!("already shutdown"),
+        None => (),
     };
     Ok(())
 }
@@ -68,16 +71,33 @@ async fn store(State(state): State<Arc<Output>>, buf: Bytes) -> (StatusCode, Jso
     let now = OffsetDateTime::now_utc().unix_timestamp();
 
     okay_or_500(&state.logger, || async {
-        match state.out.lock().await.as_mut() {
-            Some(file) => {
-                file.inner
-                    .write_item_vectored(&[&now.to_le_bytes(), &buf])?;
-                Ok(json!({"buffered": true}))
+        let mut opt = state.out.lock().await;
+        if opt.is_none() {
+            opt.replace(new_file(&state.logger)?);
+        }
+
+        match write(
+            &mut opt.as_mut().expect("just checked").inner,
+            &[&now.to_le_bytes(), &buf],
+        ) {
+            Ok(()) => Ok(json!({"buffered": true})),
+            Err(err) => {
+                if let Err(err) = finish(&state.logger, &mut opt) {
+                    state
+                        .logger
+                        .warn(vars_dbg!(err), "unable to emergency finish");
+                }
+                Err(err)
             }
-            None => unimplemented!("already shut down?"),
         }
     })
     .await
+}
+
+fn write<W: Write>(file: &mut CompressStream<W>, item: &[&[u8]]) -> Result<()> {
+    file.write_item_vectored(item)?;
+    file.flush()?;
+    Ok(())
 }
 
 fn path_for_now() -> String {
@@ -98,6 +118,16 @@ fn new_file(logger: &Bunyarr) -> Result<Writer> {
     })
 }
 
+async fn healthcheck(State(state): State<Arc<Output>>) -> (StatusCode, Json<Value>) {
+    match state.out.lock().await.as_ref() {
+        Some(_) => (StatusCode::OK, Json(json!({"ok": true}))),
+        None => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"msg": "writer unavailable"})),
+        ),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let logger = Bunyarr::with_name("batchy");
@@ -111,6 +141,7 @@ async fn main() -> Result<()> {
     use axum::routing::{get, post};
     let app = Router::new()
         .route("/store", post(store))
+        .route("/healthcheck", get(healthcheck))
         .route("/api/raw", get(list_files))
         .route("/api/raw/:name", get(fetch_raw))
         .route("/api/cycle", post(cycle))
