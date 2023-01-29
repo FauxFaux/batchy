@@ -2,11 +2,11 @@ mod shutdown;
 
 use std::fs;
 use std::future::Future;
-use std::io::Write;
 use std::net::Ipv6Addr;
 use std::sync::Arc;
 
 use anyhow::Result;
+use archiv::{Compress, CompressOptions, CompressStream};
 use axum::body::{self, BoxBody, Bytes};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -24,7 +24,7 @@ use tower::util::ServiceExt as _;
 use tower_http::services::ServeFile;
 
 struct Writer {
-    inner: zstd::Encoder<'static, fs::File>,
+    inner: CompressStream<'static, fs::File>,
     name: String,
 }
 
@@ -33,10 +33,10 @@ struct Output {
     logger: Bunyarr,
 }
 
-fn finish(logger: &Bunyarr, writer: &mut Option<Writer>) -> std::io::Result<()> {
+fn finish(logger: &Bunyarr, writer: &mut Option<Writer>) -> Result<()> {
     match writer.take() {
         Some(writer) => {
-            writer.inner.finish()?.flush()?;
+            writer.inner.finish()?;
             logger.info(json!({ "file_name": writer.name }), "completed file");
         }
         None => unimplemented!("already shutdown"),
@@ -74,7 +74,7 @@ async fn list_files(State(state): State<Arc<Output>>) -> (StatusCode, Json<Value
                 None => continue,
             };
 
-            let ext = ".events.zstd";
+            let ext = ".events.archiv";
             if !val.ends_with(ext) {
                 continue;
             }
@@ -106,7 +106,7 @@ async fn fetch_raw(State(state): State<Arc<Output>>, Path(name): Path<String>) -
         return empty_status_response(StatusCode::BAD_REQUEST);
     }
 
-    let file_name = format!("{}.events.zstd", name);
+    let file_name = format!("{}.events.archiv", name);
     match ServeFile::new_with_mime(
         file_name,
         &"application/zstd".parse().expect("static mime type"),
@@ -166,15 +166,13 @@ async fn store(State(state): State<Arc<Output>>, buf: Bytes) -> (StatusCode, Jso
             Json(json!({ "error": "too long" })),
         );
     }
-    let item_length = u64::try_from(8 + 8 + buf.len()).expect("4MB < 2^64 bytes");
     let now = OffsetDateTime::now_utc().unix_timestamp();
 
     okay_or_500(&state.logger, || async {
         match state.out.lock().await.as_mut() {
             Some(file) => {
-                file.inner.write_all(&item_length.to_le_bytes())?;
-                file.inner.write_all(&now.to_le_bytes())?;
-                file.inner.write_all(&buf)?;
+                file.inner
+                    .write_item_vectored(&[&now.to_le_bytes(), &buf])?;
                 Ok(json!({"buffered": true}))
             }
             None => unimplemented!("already shut down?"),
@@ -187,12 +185,13 @@ fn path_for_now() -> String {
     let time = OffsetDateTime::now_utc()
         .format(&Rfc3339)
         .expect("static formatter");
-    format!("{}.events.zstd", time)
+    format!("{}.events.archiv", time)
 }
 
-fn new_file(logger: &Bunyarr) -> std::io::Result<Writer> {
+fn new_file(logger: &Bunyarr) -> Result<Writer> {
     let file_name = path_for_now();
-    let inner = zstd::Encoder::new(fs::File::create(&file_name)?, 3)?;
+    let opts = CompressOptions::<'static>::default();
+    let inner = opts.stream_compress(fs::File::create(&file_name)?)?;
     logger.info(vars!(file_name), "new event file created");
     Ok(Writer {
         inner,
