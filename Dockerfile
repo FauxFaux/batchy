@@ -4,12 +4,12 @@ FROM clux/muslrust:stable as builder
 
 # download the index
 RUN cargo search lazy_static
+RUN cargo install cargo-auditable
 ADD Cargo.* .
 RUN mkdir src && echo 'fn main() {}' > src/main.rs && cargo fetch
 ENV CARGO_PROFILE_RELEASE_LTO=true
-RUN cargo check --release --target x86_64-unknown-linux-musl
 ADD . .
-RUN cargo build --release
+RUN cargo auditable build --release
 
 FROM alpine:3
 USER 65534
