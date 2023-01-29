@@ -139,13 +139,16 @@ async fn main() -> Result<()> {
     };
 
     use axum::routing::{get, post};
+    let state = Arc::new(state);
     let app = Router::new()
         .route("/store", post(store))
         .route("/healthcheck", get(healthcheck))
         .route("/api/raw", get(list_files))
         .route("/api/raw/:name", get(fetch_raw))
         .route("/api/cycle", post(cycle))
-        .with_state(Arc::new(state));
+        .with_state(Arc::clone(&state));
+
+    tokio::spawn(time_based_cycle(state));
 
     let port = 3000;
     logger.info(vars!(port), "server starting");

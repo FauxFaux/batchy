@@ -1,5 +1,6 @@
 use std::fs;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::{finish, new_file, okay_or_500, Output};
 use axum::body::{self, BoxBody};
@@ -113,4 +114,32 @@ pub async fn cycle(State(state): State<Arc<Output>>) -> (StatusCode, Json<Value>
         Ok(json!({}))
     })
     .await
+}
+
+pub async fn time_based_cycle(output: Arc<Output>) {
+    let hour = 60 * 60;
+    let mut interval = tokio::time::interval(Duration::from_secs(24 * hour));
+    // consume initial "immediate" firing
+    interval.tick().await;
+
+    loop {
+        interval.tick().await;
+
+        let mut opt = output.out.lock().await;
+        if let Err(err) = finish(&output.logger, &mut opt) {
+            output
+                .logger
+                .error(vars_dbg!(err), "unable to time-based finish");
+        }
+        match new_file(&output.logger) {
+            Ok(next) => {
+                opt.replace(next);
+            }
+            Err(err) => {
+                output
+                    .logger
+                    .error(vars_dbg!(err), "unable to time-based refresh");
+            }
+        };
+    }
 }

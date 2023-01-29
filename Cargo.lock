@@ -10,7 +10,9 @@ checksum = "2cb2f989d18dd141ab8ae82f64d1a8cdd37e0840f73a406896cf5e99502fab61"
 
 [[package]]
 name = "archiv"
-version = "0.1.0"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "071ac1f1e4c88b9b502b2d01e80c30c14c4c633522f0040293ce087601720af4"
 dependencies = [
  "thiserror",
  "zstd",
