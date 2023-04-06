@@ -12,6 +12,8 @@ ADD . .
 RUN cargo auditable build --release
 
 FROM alpine:3
+RUN apk add --no-cache dumb-init rsync openssh-client
+ENTRYPOINT ["/usr/bin/dumb-init", "--"]
 USER 65534
 
 #RUN mkdir /data && chown 65534:65534 /data
