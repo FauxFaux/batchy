@@ -35,13 +35,10 @@ pub struct Output {
 }
 
 fn finish(logger: &Bunyarr, writer: &mut Option<Writer>) -> Result<()> {
-    match writer.take() {
-        Some(writer) => {
-            writer.inner.finish()?;
-            logger.info(json!({ "file_name": writer.name }), "completed file");
-        }
-        None => (),
-    };
+    if let Some(writer) = writer.take() {
+        writer.inner.finish()?;
+        logger.info(json!({ "file_name": writer.name }), "completed file");
+    }
     Ok(())
 }
 
